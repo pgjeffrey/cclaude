@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "Error: 'claude' command not found in PATH."
+  exit 127
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: 'jq' command not found in PATH."
+  exit 127
+fi
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+  echo "Error: cclaude requires an interactive terminal."
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.json"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "Error: config file not found: $CONFIG_FILE"
+  exit 1
+fi
+
+CONFIG_JSON="$(< "$CONFIG_FILE")"
+
+if ! jq empty <<<"$CONFIG_JSON" 2>/dev/null; then
+  echo "Error: invalid JSON in $CONFIG_FILE"
+  exit 1
+fi
+
+MODEL_ITEMS_JSON="$(jq -c '
+  [{"label":"保持现状（直接启动）","params":{"action":"passthrough"}}]
+  + .
+  + [{"label":"Exit","params":{"action":"exit"}}]
+' <<<"$CONFIG_JSON")"
+
+labels=()
+while IFS= read -r label; do
+  labels+=("$label")
+done < <(jq -r '.[].label' <<<"$MODEL_ITEMS_JSON")
+
+selected=0
+choice_idx=-1
+choice=""
+action=""
+auth_token=""
+base_url=""
+stty_state="$(stty -g)"
+
+cleanup() {
+  stty "${stty_state}" 2>/dev/null || true
+  tput cnorm 2>/dev/null || true
+}
+
+on_interrupt() {
+  trap - EXIT
+  cleanup
+  printf "\nCancelled.\n"
+  exit 130
+}
+
+draw_menu() {
+  printf '\033[2J\033[H'
+  printf "Select Claude model (up/down + Enter):\n\n"
+  for i in "${!labels[@]}"; do
+    if (( i == selected )); then
+      printf "  \033[7m> %s\033[0m\n" "${labels[$i]}"
+    else
+      printf "    %s\n" "${labels[$i]}"
+    fi
+  done
+}
+
+trap on_interrupt INT TERM
+trap cleanup EXIT
+
+tput civis 2>/dev/null || true
+stty -echo -icanon
+
+draw_menu
+while true; do
+  IFS= read -rsn1 -d '' key || true
+
+  case "${key:-}" in
+    $'\x1b')
+      IFS= read -rsn2 -d '' rest || true
+      key+="${rest:-}"
+      case "$key" in
+        $'\x1b[A') ((selected--)) ;;
+        $'\x1b[B') ((selected++)) ;;
+      esac
+      ;;
+    k)
+      ((selected--))
+      ;;
+    j)
+      ((selected++))
+      ;;
+    $'\n'|$'\r')
+      choice_idx=$selected
+      params_json="$(jq -c ".[$choice_idx].params" <<<"$MODEL_ITEMS_JSON")"
+      choice="$(jq -r '.model // ""' <<<"$params_json")"
+      auth_token="$(jq -r '.auth_token // ""' <<<"$params_json")"
+      base_url="$(jq -r '.base_url // ""' <<<"$params_json")"
+      action="$(jq -r '.action // ""' <<<"$params_json")"
+      extra_params="$(jq -c 'del(.model, .auth_token, .base_url, .action) | to_entries' <<<"$params_json")"
+      break
+      ;;
+    *) ;;
+  esac
+
+  if (( selected < 0 )); then
+    selected=$((${#labels[@]} - 1))
+  elif (( selected >= ${#labels[@]} )); then
+    selected=0
+  fi
+
+  draw_menu
+done
+
+cleanup
+trap - EXIT INT TERM
+printf '\033[2J\033[H'
+
+if [[ "$action" == "exit" ]]; then
+  echo "Cancelled."
+  exit 0
+fi
+
+if [[ "$action" == "passthrough" ]]; then
+  echo "Launching Claude with current settings."
+  exec claude
+fi
+
+# Provider/env settings required by your gateway.
+export ANTHROPIC_AUTH_TOKEN="$auth_token"
+export ANTHROPIC_BASE_URL="$base_url"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$choice"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$choice"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$choice"
+export ANTHROPIC_MODEL="$choice"
+
+# Export extra params as environment variables.
+while IFS=$'\t' read -r ekey eval; do
+  [[ -z "$ekey" ]] && continue
+  export "$ekey=$eval"
+done < <(jq -r '.[] | [.key, (.value | tostring)] | @tsv' <<<"$extra_params")
+
+# Temporarily sync Claude user settings so /status reflects the selected endpoint.
+# Restore original settings after this Claude session exits.
+settings_file="$HOME/.claude/settings.json"
+settings_backup="$(mktemp)"
+had_settings=0
+restored=0
+
+if [[ -f "$settings_file" ]]; then
+  had_settings=1
+  cp "$settings_file" "$settings_backup"
+fi
+
+restore_settings() {
+  if (( restored == 1 )); then
+    return
+  fi
+  if (( had_settings == 1 )); then
+    cp "$settings_backup" "$settings_file"
+  else
+    rm -f "$settings_file"
+  fi
+  rm -f "$settings_backup"
+  restored=1
+}
+
+trap restore_settings EXIT
+
+tmp_settings="$(mktemp)"
+jq_merge_filter='
+  .env = (.env // {}) |
+  .env.ANTHROPIC_AUTH_TOKEN = $auth |
+  .env.ANTHROPIC_BASE_URL = $base |
+  .env.ANTHROPIC_DEFAULT_HAIKU_MODEL = $model |
+  .env.ANTHROPIC_DEFAULT_OPUS_MODEL = $model |
+  .env.ANTHROPIC_DEFAULT_SONNET_MODEL = $model |
+  .env.ANTHROPIC_MODEL = $model |
+  .env += ([$extras[] | {(.key): (.value | tostring)}] | add // {})
+'
+if [[ -f "$settings_file" ]]; then
+  jq \
+    --arg auth "$auth_token" \
+    --arg base "$base_url" \
+    --arg model "$choice" \
+    --argjson extras "$extra_params" \
+    "$jq_merge_filter" \
+    "$settings_file" > "$tmp_settings"
+else
+  jq -n \
+    --arg auth "$auth_token" \
+    --arg base "$base_url" \
+    --arg model "$choice" \
+    --argjson extras "$extra_params" \
+    '{env: {}} | '"$jq_merge_filter" > "$tmp_settings"
+fi
+mkdir -p "$(dirname "$settings_file")"
+mv "$tmp_settings" "$settings_file"
+
+echo "Launching Claude with model: $choice, base_url: $ANTHROPIC_BASE_URL"
+set +e
+claude --model "$choice"
+claude_rc=$?
+set -e
+restore_settings
+trap - EXIT
+exit "$claude_rc"

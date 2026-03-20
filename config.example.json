@@ -1,0 +1,27 @@
+[
+  {
+    "label": "my_server_opus-4-6",
+    "params": {
+      "model": "claude-opus-4-6",
+      "auth_token": "sk-your-auth-token-here",
+      "base_url": "https://your-server-address:8443/"
+    }
+  },
+  {
+    "label": "my_server_sonnet-4",
+    "params": {
+      "model": "claude-sonnet-4-20250514",
+      "auth_token": "sk-your-auth-token-here",
+      "base_url": "https://your-server-address:8443/"
+    }
+  },
+  {
+    "label": "example_with_extra_env",
+    "params": {
+      "model": "claude-opus-4-6",
+      "auth_token": "sk-your-auth-token-here",
+      "base_url": "https://your-server-address:8443/",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1
+    }
+  }
+]
