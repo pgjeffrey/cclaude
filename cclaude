@@ -48,6 +48,7 @@ choice=""
 action=""
 auth_token=""
 base_url=""
+explicit_models=""
 stty_state="$(stty -g)"
 
 cleanup() {
@@ -106,7 +107,21 @@ while true; do
       auth_token="$(jq -r '.auth_token // ""' <<<"$params_json")"
       base_url="$(jq -r '.base_url // ""' <<<"$params_json")"
       action="$(jq -r '.action // ""' <<<"$params_json")"
-      extra_params="$(jq -c 'del(.model, .auth_token, .base_url, .action) | to_entries' <<<"$params_json")"
+      explicit_models="$(jq -r '
+        if (has("ANTHROPIC_DEFAULT_HAIKU_MODEL") and has("ANTHROPIC_DEFAULT_OPUS_MODEL") and
+            has("ANTHROPIC_DEFAULT_SONNET_MODEL") and has("ANTHROPIC_MODEL")) then 1 else 0 end
+      ' <<<"$params_json")"
+      if [[ "$explicit_models" == "1" ]]; then
+        extra_params="$(jq -c '
+          del(
+            .model, .auth_token, .base_url, .action,
+            .ANTHROPIC_DEFAULT_HAIKU_MODEL, .ANTHROPIC_DEFAULT_OPUS_MODEL,
+            .ANTHROPIC_DEFAULT_SONNET_MODEL, .ANTHROPIC_MODEL
+          ) | to_entries
+        ' <<<"$params_json")"
+      else
+        extra_params="$(jq -c 'del(.model, .auth_token, .base_url, .action) | to_entries' <<<"$params_json")"
+      fi
       break
       ;;
     *) ;;
@@ -135,13 +150,27 @@ if [[ "$action" == "passthrough" ]]; then
   exec claude
 fi
 
+if [[ "$explicit_models" == "1" ]]; then
+  env_haiku="$(jq -r '.ANTHROPIC_DEFAULT_HAIKU_MODEL' <<<"$params_json")"
+  env_opus="$(jq -r '.ANTHROPIC_DEFAULT_OPUS_MODEL' <<<"$params_json")"
+  env_sonnet="$(jq -r '.ANTHROPIC_DEFAULT_SONNET_MODEL' <<<"$params_json")"
+  env_primary="$(jq -r '.ANTHROPIC_MODEL' <<<"$params_json")"
+  claude_model_arg="$env_primary"
+else
+  env_haiku="$choice"
+  env_opus="$choice"
+  env_sonnet="$choice"
+  env_primary="$choice"
+  claude_model_arg="$choice"
+fi
+
 # Provider/env settings required by your gateway.
 export ANTHROPIC_AUTH_TOKEN="$auth_token"
 export ANTHROPIC_BASE_URL="$base_url"
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="$choice"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="$choice"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="$choice"
-export ANTHROPIC_MODEL="$choice"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$env_haiku"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$env_opus"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$env_sonnet"
+export ANTHROPIC_MODEL="$env_primary"
 
 # Export extra params as environment variables.
 while IFS=$'\t' read -r ekey eval; do
@@ -181,17 +210,20 @@ jq_merge_filter='
   .env = (.env // {}) |
   .env.ANTHROPIC_AUTH_TOKEN = $auth |
   .env.ANTHROPIC_BASE_URL = $base |
-  .env.ANTHROPIC_DEFAULT_HAIKU_MODEL = $model |
-  .env.ANTHROPIC_DEFAULT_OPUS_MODEL = $model |
-  .env.ANTHROPIC_DEFAULT_SONNET_MODEL = $model |
-  .env.ANTHROPIC_MODEL = $model |
+  .env.ANTHROPIC_DEFAULT_HAIKU_MODEL = $haiku |
+  .env.ANTHROPIC_DEFAULT_OPUS_MODEL = $opus |
+  .env.ANTHROPIC_DEFAULT_SONNET_MODEL = $sonnet |
+  .env.ANTHROPIC_MODEL = $primary |
   .env += ([$extras[] | {(.key): (.value | tostring)}] | add // {})
 '
 if [[ -f "$settings_file" ]]; then
   jq \
     --arg auth "$auth_token" \
     --arg base "$base_url" \
-    --arg model "$choice" \
+    --arg haiku "$env_haiku" \
+    --arg opus "$env_opus" \
+    --arg sonnet "$env_sonnet" \
+    --arg primary "$env_primary" \
     --argjson extras "$extra_params" \
     "$jq_merge_filter" \
     "$settings_file" > "$tmp_settings"
@@ -199,16 +231,19 @@ else
   jq -n \
     --arg auth "$auth_token" \
     --arg base "$base_url" \
-    --arg model "$choice" \
+    --arg haiku "$env_haiku" \
+    --arg opus "$env_opus" \
+    --arg sonnet "$env_sonnet" \
+    --arg primary "$env_primary" \
     --argjson extras "$extra_params" \
     '{env: {}} | '"$jq_merge_filter" > "$tmp_settings"
 fi
 mkdir -p "$(dirname "$settings_file")"
 mv "$tmp_settings" "$settings_file"
 
-echo "Launching Claude with model: $choice, base_url: $ANTHROPIC_BASE_URL"
+echo "Launching Claude with model: $claude_model_arg, base_url: $ANTHROPIC_BASE_URL"
 set +e
-claude --model "$choice"
+claude --model "$claude_model_arg"
 claude_rc=$?
 set -e
 restore_settings
